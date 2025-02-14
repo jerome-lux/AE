@@ -37,6 +37,7 @@ def adversarial_train(
     epochs,
     gen_optimizer,
     discr_optimizer,
+    test_loader=None,
     gen_loss_func=G_GANLoss,
     discr_loss_func=D_GANLoss,
     rec_loss_func=None,
@@ -64,13 +65,21 @@ def adversarial_train(
     gen_best_loss = float("inf")
     rec_best_loss = float("inf")
     discr_best_loss = float("inf")
+
+    test_gen_best_loss = float("inf")
+    test_rec_best_loss = float("inf")
+    test_discr_best_loss = float("inf")
+
     if iterations is None:
         iterations = len(dataloader)
+    else:
+        iterations = min(len(dataloader), iterations)
 
     for epoch in range(epochs):
 
         generator.train()
         discriminator.train()
+
         gen_loss_meter = AverageMeter()
         discr_loss_meter = AverageMeter()
         adv_loss_meter = AverageMeter()
@@ -79,6 +88,7 @@ def adversarial_train(
         gp1_meter = AverageMeter()
         gp2_meter = AverageMeter()
 
+        # Training loop
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
 
         for i, (real_data, _) in enumerate(progress_bar):
@@ -136,7 +146,7 @@ def adversarial_train(
                 }
             )
 
-            # Schedulers doivent être updatés à chaque batch
+            # Schedulers qui doivent être updatés à chaque batch
             if gen_scheduler is not None and not isinstance(gen_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 gen_scheduler.step()
 
@@ -176,6 +186,73 @@ def adversarial_train(
         writer.add_scalar("Discriminator_loss", discr_loss_meter.avg, epoch + 1)
         writer.add_scalar("Gen lr", gen_optimizer.param_groups[0]["lr"], epoch + 1)
         writer.add_scalar("Discr lr", discr_optimizer.param_groups[0]["lr"], epoch + 1)
+
+        if test_loader is not None:
+
+            test_gen_loss_meter = AverageMeter()
+            test_discr_loss_meter = AverageMeter()
+            test_adv_loss_meter = AverageMeter()
+            test_rec_loss_val_meter = AverageMeter()
+            test_rec_loss_val_meter.update(0, 1)
+
+            # Test step: set the model to inference mode
+            generator.eval()
+            discriminator.eval()
+            progress_bar = tqdm(
+                test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
+            )
+
+            for i, (real_data, _) in enumerate(progress_bar):
+                real_data = real_data.to(device)
+                fake_data = generator(real_data)
+
+                discr_loss, _, _ = discr_loss_func(discriminator, fake_data, real_data)
+
+                adv_loss = gen_loss_func(discriminator, fake_data, real_data)
+
+                rec_loss_value = 0.0
+                if rec_loss_func is not None:
+                    if not isinstance(rec_loss_func, (list, tuple)):
+                        rec_loss_func = [rec_loss_func]
+                    for rec_loss in rec_loss_func:
+                        rec_loss_value += rec_loss(fake_data, real_data)
+
+                    gen_loss = (1.0 - rec_loss_weight) * adv_loss + rec_loss_weight * rec_loss_value
+
+                else:
+                    gen_loss = adv_loss
+                test_discr_loss_meter.update(discr_loss.item(), real_data.size(0))
+                test_discr_loss_meter.update(gen_loss.item(), real_data.size(0))
+                test_adv_loss_meter.update(adv_loss.item(), real_data.size(0))
+                if rec_loss_func is not None:
+                    test_rec_loss_val_meter.update(rec_loss_value.item(), real_data.size(0))
+                test_gen_loss_meter.update(gen_loss.item(), real_data.size(0))
+
+                progress_bar.set_postfix(
+                    ordered_dict={
+                        "gen_loss": test_gen_loss_meter.avg,
+                        "adv_loss": test_adv_loss_meter.avg,
+                        "rec_loss": test_rec_loss_val_meter.avg,
+                        "discr_loss": test_discr_loss_meter.avg,
+                    }
+                )
+
+            if test_gen_loss_meter.avg < test_gen_best_loss or epoch == 0:
+                test_gen_best_loss = test_gen_loss_meter.avg
+                torch.save(generator.state_dict(), Path(savepath) / Path("test_gen_best_model.pth"))
+
+            if test_rec_loss_val_meter.avg < test_rec_best_loss or epoch == 0:
+                rec_best_loss = test_rec_loss_val_meter.avg
+                torch.save(generator.state_dict(), Path(savepath) / Path("test_rec_best_model.pth"))
+
+            if test_discr_loss_meter.avg < test_discr_best_loss or epoch == 0:
+                discr_best_loss = test_discr_loss_meter.avg
+                torch.save(discriminator.state_dict(), Path(savepath) / Path("test_discriminator_best_model.pth"))
+
+            writer.add_scalar("Gen_test_loss", test_gen_loss_meter.avg, epoch + 1)
+            writer.add_scalar("Gen GAN test loss", test_adv_loss_meter.avg, epoch + 1)
+            writer.add_scalar("Gen rec test loss", test_rec_loss_val_meter.avg, epoch + 1)
+            writer.add_scalar("Discriminator test loss", test_discr_loss_meter.avg, epoch + 1)
 
 
 def train(
